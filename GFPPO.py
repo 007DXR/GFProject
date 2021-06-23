@@ -1,393 +1,360 @@
-import torch
-import torch.nn as nn
-from torch.distributions import MultivariateNormal
-from torch.distributions import Categorical
-import os
-import glob
-import time
-from datetime import datetime
 import gfootball.env as football_env
-import torch
+import os
+import argparse
 import numpy as np
-seed = 1
-render =False
-################################## set device ##################################
+import torch
+from torch import optim
+from datetime import datetime
+import copy
+from torch import nn
+from torch.nn import functional as F
+from baselines.common.vec_env.subproc_vec_env import SubprocVecEnv
+from torch.distributions.categorical import Categorical
+import random
+import logging
 
-device = torch.device('cpu')
+# select actions
+def select_actions(pi):
+    actions = Categorical(pi).sample()
+    # return actions
+    return actions.detach().cpu().numpy().squeeze()
 
-################################## PPO Policy ##################################
+# evaluate actions
+def evaluate_actions(pi, actions):
+    cate_dist = Categorical(pi)
+    log_prob = cate_dist.log_prob(actions).unsqueeze(-1)
+    entropy = cate_dist.entropy().mean()
+    return log_prob, entropy
+
+# configure the logger
+def config_logger(log_dir):
+    logger = logging.getLogger()
+    # we don't do the debug...
+    logger.setLevel('INFO')
+    basic_format = '%(message)s'
+    formatter = logging.Formatter(basic_format)
+    chlr = logging.StreamHandler()
+    chlr.setFormatter(formatter)
+    # set the log file handler
+    fhlr = logging.FileHandler(log_dir)
+    logger.addHandler(chlr)
+    logger.addHandler(fhlr)
+    return logger
+def get_args():
+    parse = argparse.ArgumentParser()
+    parse.add_argument('--gamma', type=float, default=0.993, help='the discount factor of RL')
+    parse.add_argument('--seed', type=int, default=123, help='the random seeds')
+    parse.add_argument('--num-workers', type=int, default=8, help='the number of workers to collect samples')
+    parse.add_argument('--env-name', type=str, default='academy_3_vs_1_with_keeper', help='the environment name')
+    parse.add_argument('--batch-size', type=int, default=8, help='the batch size of updating')
+    parse.add_argument('--lr', type=float, default=0.00008, help='learning rate of the algorithm')
+    parse.add_argument('--epoch', type=int, default=4, help='the epoch during training')
+    parse.add_argument('--nsteps', type=int, default=128, help='the steps to collect samples')
+    parse.add_argument('--vloss-coef', type=float, default=0.5, help='the coefficient of value loss')
+    parse.add_argument('--ent-coef', type=float, default=0.01, help='the entropy loss coefficient')
+    parse.add_argument('--tau', type=float, default=0.95, help='gae coefficient')
+    parse.add_argument('--cuda', action='store_true', help='use cuda do the training')
+    parse.add_argument('--total-frames', type=int, default=int(2e8), help='the total frames for training')
+    parse.add_argument('--eps', type=float, default=1e-5, help='param for adam optimizer')
+    parse.add_argument('--clip', type=float, default=0.27, help='the ratio clip param')
+    parse.add_argument('--save-dir', type=str, default='./', help='the folder to save models')
+    parse.add_argument('--lr-decay', action='store_true', help='if using the learning rate decay during decay')
+    parse.add_argument('--max-grad-norm', type=float, default=0.5, help='grad norm')
+    parse.add_argument('--display-interval', type=int, default=10, help='the interval that display log information')
+    parse.add_argument('--log-dir', type=str, default='logs/')
+
+    args = parse.parse_args()
+
+    return args
 
 
-class RolloutBuffer:
+
+class ppo_agent:
+    def __init__(self, envs, args, net):
+        self.envs = envs 
+        self.args = args
+        # define the newtork...
+        self.net = net
+        self.old_net = copy.deepcopy(self.net)
+        # if use the cuda...
+        if self.args.cuda:
+            self.net.cuda()
+            self.old_net.cuda()
+        # define the optimizer...
+        self.optimizer = optim.Adam(self.net.parameters(), self.args.lr, eps=self.args.eps)
+        # check saving folder..
+        if not os.path.exists(self.args.save_dir):
+            os.mkdir(self.args.save_dir)
+        # env folder..
+        self.model_path = os.path.join(self.args.save_dir, self.args.env_name)
+        if not os.path.exists(self.model_path):
+            os.mkdir(self.model_path)
+        # logger folder
+        if not os.path.exists(self.args.log_dir):
+            os.mkdir(self.args.log_dir)
+        self.log_path = self.args.log_dir + self.args.env_name + '.log'
+        # get the observation
+        self.batch_ob_shape = (self.args.num_workers * self.args.nsteps, ) + self.envs.observation_space.shape
+        self.obs = np.zeros((self.args.num_workers, ) + self.envs.observation_space.shape, dtype=self.envs.observation_space.dtype.name)
+        self.obs[:] = self.envs.reset()
+        self.dones = [False for _ in range(self.args.num_workers)]
+        self.logger = config_logger(self.log_path)
+
+    # start to train the network...
+    def learn(self):
+        num_updates = self.args.total_frames // (self.args.nsteps * self.args.num_workers)
+        # get the reward to calculate other informations
+        episode_rewards = torch.zeros([self.args.num_workers, 1])
+        final_rewards = torch.zeros([self.args.num_workers, 1])
+        for update in range(num_updates):
+            mb_obs, mb_rewards, mb_actions, mb_dones, mb_values = [], [], [], [], []
+            if self.args.lr_decay:
+                self._adjust_learning_rate(update, num_updates)
+            for step in range(self.args.nsteps):
+                with torch.no_grad():
+                    # get tensors
+                    obs_tensor = self._get_tensors(self.obs)
+                    values, pis = self.net(obs_tensor)
+                # select actions
+                actions = select_actions(pis)
+                # get the input actions
+                input_actions = actions 
+                # start to store information
+                mb_obs.append(np.copy(self.obs))
+                mb_actions.append(actions)
+                mb_dones.append(self.dones)
+                mb_values.append(values.detach().cpu().numpy().squeeze())
+                # start to excute the actions in the environment
+                obs, rewards, dones, _ = self.envs.step(input_actions)
+                # update dones
+                self.dones = dones
+                mb_rewards.append(rewards)
+                # clear the observation
+                for n, done in enumerate(dones):
+                    if done:
+                        self.obs[n] = self.obs[n] * 0
+                self.obs = obs
+                # process the rewards part -- display the rewards on the screen
+                rewards = torch.tensor(np.expand_dims(np.stack(rewards), 1), dtype=torch.float32)
+                episode_rewards += rewards
+                masks = torch.tensor([[0.0] if done_ else [1.0] for done_ in dones], dtype=torch.float32)
+                final_rewards *= masks
+                final_rewards += (1 - masks) * episode_rewards
+                episode_rewards *= masks
+            # process the rollouts
+            mb_obs = np.asarray(mb_obs, dtype=np.float32)
+            mb_rewards = np.asarray(mb_rewards, dtype=np.float32)
+            mb_actions = np.asarray(mb_actions, dtype=np.float32)
+            mb_dones = np.asarray(mb_dones, dtype=np.bool)
+            mb_values = np.asarray(mb_values, dtype=np.float32)
+            # compute the last state value
+            with torch.no_grad():
+                obs_tensor = self._get_tensors(self.obs)
+                last_values, _ = self.net(obs_tensor)
+                last_values = last_values.detach().cpu().numpy().squeeze()
+            # start to compute advantages...
+            mb_returns = np.zeros_like(mb_rewards)
+            mb_advs = np.zeros_like(mb_rewards)
+            lastgaelam = 0
+            for t in reversed(range(self.args.nsteps)):
+                if t == self.args.nsteps - 1:
+                    nextnonterminal = 1.0 - self.dones
+                    nextvalues = last_values
+                else:
+                    nextnonterminal = 1.0 - mb_dones[t + 1]
+                    nextvalues = mb_values[t + 1]
+                delta = mb_rewards[t] + self.args.gamma * nextvalues * nextnonterminal - mb_values[t]
+                mb_advs[t] = lastgaelam = delta + self.args.gamma * self.args.tau * nextnonterminal * lastgaelam
+            mb_returns = mb_advs + mb_values
+            # after compute the returns, let's process the rollouts
+            mb_obs = mb_obs.swapaxes(0, 1).reshape(self.batch_ob_shape)
+            mb_actions = mb_actions.swapaxes(0, 1).flatten()
+            mb_returns = mb_returns.swapaxes(0, 1).flatten()
+            mb_advs = mb_advs.swapaxes(0, 1).flatten()
+            # before update the network, the old network will try to load the weights
+            self.old_net.load_state_dict(self.net.state_dict())
+            # start to update the network
+            pl, vl, ent = self._update_network(mb_obs, mb_actions, mb_returns, mb_advs)
+            # display the training information
+            if update % self.args.display_interval == 0:
+                self.logger.info('[{}] Update: {} / {}, Frames: {}, Rewards: {:.3f}, Min: {:.3f}, Max: {:.3f}, PL: {:.3f},'\
+                    'VL: {:.3f}, Ent: {:.3f}'.format(datetime.now(), update, num_updates, (update + 1)*self.args.nsteps*self.args.num_workers, \
+                    final_rewards.mean().item(), final_rewards.min().item(), final_rewards.max().item(), pl, vl, ent))
+                # save the model
+                torch.save(self.net.state_dict(), self.model_path + '/model.pt')
+
+    # update the network
+    def _update_network(self, obs, actions, returns, advantages):
+        inds = np.arange(obs.shape[0])
+        nbatch_train = obs.shape[0] // self.args.batch_size
+        for _ in range(self.args.epoch):
+            np.random.shuffle(inds)
+            for start in range(0, obs.shape[0], nbatch_train):
+                # get the mini-batchs
+                end = start + nbatch_train
+                mbinds = inds[start:end]
+                mb_obs = obs[mbinds]
+                mb_actions = actions[mbinds]
+                mb_returns = returns[mbinds]
+                mb_advs = advantages[mbinds]
+                # convert minibatches to tensor
+                mb_obs = self._get_tensors(mb_obs)
+                mb_actions = torch.tensor(mb_actions, dtype=torch.float32)
+                mb_returns = torch.tensor(mb_returns, dtype=torch.float32).unsqueeze(1)
+                mb_advs = torch.tensor(mb_advs, dtype=torch.float32).unsqueeze(1)
+                # normalize adv
+                mb_advs = (mb_advs - mb_advs.mean()) / (mb_advs.std() + 1e-8)
+                if self.args.cuda:
+                    mb_actions = mb_actions.cuda()
+                    mb_returns = mb_returns.cuda()
+                    mb_advs = mb_advs.cuda()
+                # start to get values
+                mb_values, pis = self.net(mb_obs)
+                # start to calculate the value loss...
+                value_loss = (mb_returns - mb_values).pow(2).mean()
+                # start to calculate the policy loss
+                with torch.no_grad():
+                    _, old_pis = self.old_net(mb_obs)
+                    # get the old log probs
+                    old_log_prob, _ = evaluate_actions(old_pis, mb_actions)
+                    old_log_prob = old_log_prob.detach()
+                # evaluate the current policy
+                log_prob, ent_loss = evaluate_actions(pis, mb_actions)
+                prob_ratio = torch.exp(log_prob - old_log_prob)
+                # surr1
+                surr1 = prob_ratio * mb_advs
+                surr2 = torch.clamp(prob_ratio, 1 - self.args.clip, 1 + self.args.clip) * mb_advs
+                policy_loss = -torch.min(surr1, surr2).mean()
+                # final total loss
+                total_loss = policy_loss + self.args.vloss_coef * value_loss - ent_loss * self.args.ent_coef
+                # clear the grad buffer
+                self.optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.args.max_grad_norm)
+                # update
+                self.optimizer.step()
+        return policy_loss.item(), value_loss.item(), ent_loss.item()
+
+    # convert the numpy array to tensors
+    def _get_tensors(self, obs):
+        obs_tensor = torch.tensor(np.transpose(obs, (0, 3, 1, 2)), dtype=torch.float32)
+        # decide if put the tensor on the GPU
+        if self.args.cuda:
+            obs_tensor = obs_tensor.cuda()
+        return obs_tensor
+
+    # adjust the learning rate
+    def _adjust_learning_rate(self, update, num_updates):
+        lr_frac = 1 - (update / num_updates)
+        adjust_lr = self.args.lr * lr_frac
+        for param_group in self.optimizer.param_groups:
+             param_group['lr'] = adjust_lr
+
+# create the environment
+def create_single_football_env(args):
+    """Creates gfootball environment."""
+    env = football_env.create_environment(\
+            env_name=args.env_name, stacked=True,render=False
+            )
+    return env
+
+
+"""
+this network is modified for the google football
+
+"""
+# the convolution layer of deepmind
+class deepmind(nn.Module):
     def __init__(self):
-        self.actions = []
-        self.states = []
-        self.logprobs = []
-        self.rewards = []
-        self.is_terminals = []
-    
-
-    def clear(self):
-        del self.actions[:]
-        del self.states[:]
-        del self.logprobs[:]
-        del self.rewards[:]
-        del self.is_terminals[:]
-
-
-class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, has_continuous_action_space, action_std_init):
-        super(ActorCritic, self).__init__()
-
-        self.has_continuous_action_space = has_continuous_action_space
-
-        if has_continuous_action_space:
-            self.action_dim = action_dim
-            self.action_var = torch.full((action_dim,), action_std_init * action_std_init).to(device)
-
-        # actor
-        if has_continuous_action_space :
-            self.actor = nn.Sequential(
-                            nn.Linear(state_dim, 64),
-                            nn.Tanh(),
-                            nn.Linear(64, 64),
-                            nn.Tanh(),
-                            nn.Linear(64, action_dim),
-                            nn.Tanh()
-                        )
-        else:
-            self.actor = nn.Sequential(
-                            nn.Linear(state_dim, 64),
-                            nn.Tanh(),
-                            nn.Linear(64, 64),
-                            nn.Tanh(),
-                            nn.Linear(64, action_dim),
-                            nn.Softmax(dim=-1)
-                        )
-
+        super(deepmind, self).__init__()
+        self.conv1 = nn.Conv2d(16, 32, 8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, 4, stride=2)
+        self.conv3 = nn.Conv2d(64, 32, 3, stride=1)
+        self.fc1 = nn.Linear(32 * 5 * 8, 512)        
+        # start to do the init...
+        nn.init.orthogonal_(self.conv1.weight.data, gain=nn.init.calculate_gain('relu'))
+        nn.init.orthogonal_(self.conv2.weight.data, gain=nn.init.calculate_gain('relu'))
+        nn.init.orthogonal_(self.conv3.weight.data, gain=nn.init.calculate_gain('relu'))
+        nn.init.orthogonal_(self.fc1.weight.data, gain=nn.init.calculate_gain('relu'))
+        # init the bias...
+        nn.init.constant_(self.conv1.bias.data, 0)
+        nn.init.constant_(self.conv2.bias.data, 0)
+        nn.init.constant_(self.conv3.bias.data, 0)
+        nn.init.constant_(self.fc1.bias.data, 0)
         
-        # critic
-        self.critic = nn.Sequential(
-                        nn.Linear(state_dim, 64),
-                        nn.Tanh(),
-                        nn.Linear(64, 64),
-                        nn.Tanh(),
-                        nn.Linear(64, 1)
-                    )
-        
-    def set_action_std(self, new_action_std):
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.view(-1, 32 * 5 * 8)
+        x = F.relu(self.fc1(x))
+
+        return x
+
+# in the initial, just the nature CNN
+class cnn_net(nn.Module):
+    def __init__(self, num_actions):
+        super(cnn_net, self).__init__()
+        self.cnn_layer = deepmind()
+        self.critic = nn.Linear(512, 1)
+        self.actor = nn.Linear(512, num_actions)
+
+        # init the linear layer..
+        nn.init.orthogonal_(self.critic.weight.data)
+        nn.init.constant_(self.critic.bias.data, 0)
+        # init the policy layer...
+        nn.init.orthogonal_(self.actor.weight.data, gain=0.01)
+        nn.init.constant_(self.actor.bias.data, 0)
+
+    def forward(self, inputs):
+        x = self.cnn_layer(inputs / 255.0)
+        value = self.critic(x)
+        pi = F.softmax(self.actor(x), dim=1)
+        return value, pi
+def get_tensors(obs):
+    return torch.tensor(np.transpose(obs, (0, 3, 1, 2)), dtype=torch.float32)
+
+
+'''
+#To Train a Model
+if __name__ == '__main__': 
+    # get the arguments
+    args = get_args()
+    # create environments
+    envs = SubprocVecEnv([(lambda _i=i: create_single_football_env(args)) for i in range(args.num_workers)], context=None)
+    # create networks
+    network = cnn_net(envs.action_space.n)
+    # create the ppo agent
+    ppo_trainer = ppo_agent(envs, args, network)
+    ppo_trainer.learn()
+    # close the environments
+    envs.close()
+'''
+
+
+
+#To Test
+# get the tensors
 
-        if self.has_continuous_action_space:
-            self.action_var = torch.full((self.action_dim,), new_action_std * new_action_std).to(device)
-        else:
-            print("--------------------------------------------------------------------------------------------")
-            print("WARNING : Calling ActorCritic::set_action_std() on discrete action space policy")
-            print("--------------------------------------------------------------------------------------------")
-
-
-    def forward(self):
-        raise NotImplementedError
-    
-
-    def act(self, state):
-
-        if self.has_continuous_action_space:
-            action_mean = self.actor(state)
-            cov_mat = torch.diag(self.action_var).unsqueeze(dim=0)
-            dist = MultivariateNormal(action_mean, cov_mat)
-        else:
-            action_probs = self.actor(state)
-            dist = Categorical(action_probs)
-
-        action = dist.sample()
-        action_logprob = dist.log_prob(action)
-        
-        return action.detach(), action_logprob.detach()
-    
-
-    def evaluate(self, state, action):
-
-        if self.has_continuous_action_space:
-            action_mean = self.actor(state)
-            
-            action_var = self.action_var.expand_as(action_mean)
-            cov_mat = torch.diag_embed(action_var).to(device)
-            dist = MultivariateNormal(action_mean, cov_mat)
-            
-            # For Single Action Environments.
-            if self.action_dim == 1:
-                action = action.reshape(-1, self.action_dim)
-
-        else:
-            action_probs = self.actor(state)
-            dist = Categorical(action_probs)
-        action_logprobs = dist.log_prob(action)
-        dist_entropy = dist.entropy()
-        state_values = self.critic(state)
-        
-        return action_logprobs, state_values, dist_entropy
-
-
-class PPO:
-    def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space, action_std_init=0.6):
-
-        self.has_continuous_action_space = has_continuous_action_space
-
-        if has_continuous_action_space:
-            self.action_std = action_std_init
-
-        self.gamma = gamma
-        self.eps_clip = eps_clip
-        self.K_epochs = K_epochs
-        
-        self.buffer = RolloutBuffer()
-
-        self.policy = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
-        self.policy_old = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
-        
-        self.policy = torch.load('../param/net_param/actor_netPPO.pkl')
-        self.policy.eval()
-        self.policy_old = torch.load('../param/net_param/critic_netPPO.pkl')
-        self.policy_old.eval()
-        self.optimizer = torch.optim.Adam([
-                        {'params': self.policy.actor.parameters(), 'lr': lr_actor},
-                        {'params': self.policy.critic.parameters(), 'lr': lr_critic}
-                    ])
-        self.MseLoss = nn.MSELoss()
-    def set_action_std(self, new_action_std):
-        
-        if self.has_continuous_action_space:
-            self.action_std = new_action_std
-            self.policy.set_action_std(new_action_std)
-            self.policy_old.set_action_std(new_action_std)
-        
-        else:
-            print("--------------------------------------------------------------------------------------------")
-            print("WARNING : Calling PPO::set_action_std() on discrete action space policy")
-            print("--------------------------------------------------------------------------------------------")
-
-
-    def decay_action_std(self, action_std_decay_rate, min_action_std):
-        print("--------------------------------------------------------------------------------------------")
-
-        if self.has_continuous_action_space:
-            self.action_std = self.action_std - action_std_decay_rate
-            self.action_std = round(self.action_std, 4)
-            if (self.action_std <= min_action_std):
-                self.action_std = min_action_std
-                print("setting actor output action_std to min_action_std : ", self.action_std)
-            else:
-                print("setting actor output action_std to : ", self.action_std)
-            self.set_action_std(self.action_std)
-
-        else:
-            print("WARNING : Calling PPO::decay_action_std() on discrete action space policy")
-
-        print("--------------------------------------------------------------------------------------------")
-
-
-    def select_action(self, state):
-
-        if self.has_continuous_action_space:
-            with torch.no_grad():
-                state = torch.FloatTensor(state).to(device)
-                action, action_logprob = self.policy_old.act(state)
-
-            self.buffer.states.append(state)
-            self.buffer.actions.append(action)
-            self.buffer.logprobs.append(action_logprob)
-
-            return action.detach().cpu().numpy().flatten()
-
-        else:
-            with torch.no_grad():
-                state = torch.FloatTensor(state).to(device)
-                action, action_logprob = self.policy_old.act(state)
-            
-            self.buffer.states.append(state)
-            self.buffer.actions.append(action)
-            self.buffer.logprobs.append(action_logprob)
-
-            return action.item()
-
-
-    def update(self):
-
-        # Monte Carlo estimate of returns
-        rewards = []
-        discounted_reward = 0
-        for reward, is_terminal in zip(reversed(self.buffer.rewards), reversed(self.buffer.is_terminals)):
-            if is_terminal:
-                discounted_reward = 0
-            discounted_reward = reward + (self.gamma * discounted_reward)
-            rewards.insert(0, discounted_reward)
-            
-        # Normalizing the rewards
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
-
-        # convert list to tensor
-        old_states = torch.squeeze(torch.stack(self.buffer.states, dim=0)).detach().to(device)
-        old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(device)
-        old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(device)
-
-        
-        # Optimize policy for K epochs
-        for _ in range(self.K_epochs):
-
-            # Evaluating old actions and values
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
-
-            # match state_values tensor dimensions with rewards tensor
-            state_values = torch.squeeze(state_values)
-            
-            # Finding the ratio (pi_theta / pi_theta__old)
-            ratios = torch.exp(logprobs - old_logprobs.detach())
-
-            # Finding Surrogate Loss
-            advantages = rewards - state_values.detach()   
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
-
-            # final loss of clipped objective PPO
-            loss = -torch.min(surr1, surr2) + 0.5*self.MseLoss(state_values, rewards) - 0.01*dist_entropy
-            
-            # take gradient step
-            self.optimizer.zero_grad()
-            loss.mean().backward()
-            self.optimizer.step()
-            
-
-        # clear buffer
-        self.buffer.clear()
-################################### Training ###################################
-
-def main():
-    ####### initialize environment hyperparameters ######
-    env = football_env.create_environment(
-      env_name='academy_3_vs_1_with_keeper',
-      stacked=False,
-      representation='simple115v2',
-      rewards = 'scoring',
-      write_goal_dumps=False,
-      write_full_episode_dumps=False,
-      #render=True,
-      dump_frequency = 0)
-    torch.manual_seed(seed)
-    env.seed(seed)
-
-    has_continuous_action_space = False  # continuous action space; else discrete
-
-    max_ep_len = 1000                   # max timesteps in one episode
-    max_training_timesteps = int(3e6)   # break training loop if timeteps > max_training_timesteps
-
-    print_freq = max_ep_len * 10        # print avg reward in the interval (in num timesteps)
-    log_freq = max_ep_len * 2           # log avg reward in the interval (in num timesteps)
-    save_model_freq = int(1e5)          # save model frequency (in num timesteps)
-
-    action_std = 0.6                    # starting std for action distribution (Multivariate Normal)
-    action_std_decay_rate = 0.05        # linearly decay action_std (action_std = action_std - action_std_decay_rate)
-    min_action_std = 0.1                # minimum action_std (stop decay after action_std <= min_action_std)
-    action_std_decay_freq = int(2.5e2)  # action_std decay frequency (in num timesteps)
-
-    #####################################################
-
-
-    ## Note : print/log frequencies should be > than max_ep_len
-
-
-    ################ PPO hyperparameters ################
-
-    update_timestep = max_ep_len * 4      # update policy every n timesteps
-    K_epochs = 80               # update policy for K epochs in one PPO update
-
-    eps_clip = 0.27          # clip parameter for PPO
-    gamma = 0.993            # discount factor
-
-    lr_actor = 0.00008       # learning rate for actor network
-    lr_critic = 0.00008       # learning rate for critic network
-
-    random_seed = 0         # set random seed if required (0 = no random seed)
-
-    #####################################################
-
-    # state space dimension
-    state_dim = env.observation_space.shape[0]
-
-    # action space dimension
-    if has_continuous_action_space:
-        action_dim = env.action_space.shape[0]
-    else:
-        action_dim = env.action_space.n
-
-    ################# training procedure ################
-
-    # initialize a PPO agent
-    agent = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space, action_std)
-
-
-    # track total training time
-    start_time = datetime.now().replace(microsecond=0)
-
-
-
-    # printing and logging variables
-    print_running_reward = 0
-    print_running_episodes = 0
-
-    log_running_reward = 0
-    log_running_episodes = 0
-
-    time_step = 0
-    i_episode = 0
-
-    n_actions = env.action_space.n
-    obs_shape = list(env.observation_space.shape)
-    win=0
-    lost=0
-    for i_epoch in range(1000000):
-        #print("epoch{}".format(i_epoch))
-        if i_epoch%10==0:
-            torch.save(agent.policy, '../param/net_param/actor_netPPO.pkl')
-            torch.save(agent.policy_old, '../param/net_param/critic_netPPO.pkl')
-            
-        state = env.reset()
-        step = 0
-        sum = 0.0
-        flag = 0
-        numof4=0
-        while True:
-            step+=1
-            if render: env.render()
-            # select action with policy
-            action = agent.select_action(state)
-            state, reward, done, _ = env.step(action)
-
-            # saving reward and is_terminals
-            agent.buffer.rewards.append(reward)
-            agent.buffer.is_terminals.append(done)
-
-            time_step +=1
-
-            # update PPO agent
-            if time_step % update_timestep == 0:
-                agent.update()
-
-            # if continuous action space; then decay action std of ouput action distribution
-            if has_continuous_action_space and time_step % action_std_decay_freq == 0:
-                agent.decay_action_std(action_std_decay_rate, min_action_std)
-
-            sum+=reward
-            if done:
-                break
-        winbef=win
-        lostbef=lost
-        if sum==1:win+=1
-        if sum==-1:lost+=1
-        if win!=winbef: print("{}\t{}\t{}\t{}".format(i_epoch,win,step,lost))
 
 if __name__ == '__main__':
-    main()
-    
-    print("end")
+    args = get_args()
+    model_path = './GFPPOmodel.pt'
+    env = football_env.create_environment(\
+            env_name=args.env_name, stacked=True,
+             render=True)
+    network = cnn_net(env.action_space.n)
+    network.load_state_dict(torch.load(model_path, map_location=lambda storage, loc: storage))
+    # start to do the test
+    obs = env.reset()
+    for _ in range(10000):
+        obs_tensor = get_tensors(np.expand_dims(obs, 0))
+        with torch.no_grad():
+            _, pi = network(obs_tensor)
+        actions = torch.argmax(pi, dim=1).item()
+        obs, reward, done, _ = env.step(actions)
+        if done:
+            obs = env.reset()
+    env.close()
+
 

@@ -26,8 +26,8 @@ Transition = namedtuple('Transition', ['state', 'action',  'a_log_prob', 'reward
 class Actor(nn.Module):
     def __init__(self):
         super(Actor, self).__init__()
-        self.fc1 = nn.Linear(num_state, 128)
-        self.action_head = nn.Linear(128, num_action)
+        self.fc1 = nn.Linear(num_state, 64)
+        self.action_head = nn.Linear(64, num_action)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -38,8 +38,8 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self):
         super(Critic, self).__init__()
-        self.fc1 = nn.Linear(num_state, 128)
-        self.state_value = nn.Linear(128, 1)
+        self.fc1 = nn.Linear(num_state, 64)
+        self.state_value = nn.Linear(64, 1)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -58,10 +58,10 @@ class PPO():
         super(PPO, self).__init__()
         self.actor_net = Actor()
         self.critic_net = Critic()
-        #self.actor_net = torch.load('../param/net_param/actor_netRuleAssistedRL.pkl')
-        #self.actor_net.eval()
-        #self.critic_net = torch.load('../param/net_param/critic_netRuleAssistedRL.pkl')
-        #self.critic_net.eval()
+        self.actor_net = torch.load('./actor_netRuleAssistedRL.pkl')
+        self.actor_net.eval()
+        self.critic_net = torch.load('./critic_netRuleAssistedRL.pkl')
+        self.critic_net.eval()
         
         self.buffer = []
         self.counter = 0
@@ -69,8 +69,6 @@ class PPO():
 
         self.actor_optimizer = optim.Adam(self.actor_net.parameters(), 1e-3)
         self.critic_net_optimizer = optim.Adam(self.critic_net.parameters(), 3e-3)
-        if not os.path.exists('../param'):
-            os.makedirs('../param/net_param')
     def select_action(self, state):
         state = torch.from_numpy(state).float().unsqueeze(0)
         with torch.no_grad():
@@ -131,8 +129,8 @@ class PPO():
 
         del self.buffer[:] # clear experience
 def flt(step,action):
-    if 0<step<25: return 3
-    if step==25: return 7
+    if 0<step<24: return 3
+    if 24<=step<=25: return 7
     if step==26: return 11
     if 26<step<45 and (action<3 or action >7): return 5
     return action
@@ -153,10 +151,11 @@ def main():
     obs_shape = list(env.observation_space.shape)
     win=0
     lost=0
+    print("i_epoch\twin\tstep\tlost")
     for i_epoch in range(1000000):
         if i_epoch%10==0:
-            torch.save(agent.actor_net, '../param/net_param/actor_netRuleAssistedRL.pkl')
-            torch.save(agent.critic_net, '../param/net_param/critic_netRuleAssistedRL.pkl')
+            torch.save(agent.actor_net, './actor_netRuleAssistedRL.pkl')
+            torch.save(agent.critic_net, './critic_netRuleAssistedRL.pkl')
         state = env.reset()
         step = 0
         sum = 0.0
