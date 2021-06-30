@@ -13,20 +13,19 @@ from torch.distributions.categorical import Categorical
 import random
 import logging
 
-# select actions
+# 根据决策概率分布选择action
 def select_actions(pi):
     actions = Categorical(pi).sample()
-    # return actions
     return actions.detach().cpu().numpy().squeeze()
 
-# evaluate actions
+# 计算决策概率分布
 def evaluate_actions(pi, actions):
     cate_dist = Categorical(pi)
     log_prob = cate_dist.log_prob(actions).unsqueeze(-1)
     entropy = cate_dist.entropy().mean()
     return log_prob, entropy
 
-# configure the logger
+# 信息存储
 def config_logger(log_dir):
     logger = logging.getLogger()
     # we don't do the debug...
@@ -40,6 +39,8 @@ def config_logger(log_dir):
     logger.addHandler(chlr)
     logger.addHandler(fhlr)
     return logger
+
+#获取参数
 def get_args():
     parse = argparse.ArgumentParser()
     parse.add_argument('--gamma', type=float, default=0.993, help='the discount factor of RL')
@@ -70,17 +71,18 @@ def get_args():
 
 
 class ppo_agent:
+    #ppo初始化
     def __init__(self, envs, args, net):
         self.envs = envs 
         self.args = args
-        # define the newtork...
+        #定义神经网络
         self.net = net
         self.old_net = copy.deepcopy(self.net)
-        # if use the cuda...
+        #GPU条件
         if self.args.cuda:
             self.net.cuda()
             self.old_net.cuda()
-        # define the optimizer...
+        # 定义优化函数
         self.optimizer = optim.Adam(self.net.parameters(), self.args.lr, eps=self.args.eps)
         # check saving folder..
         if not os.path.exists(self.args.save_dir):
@@ -100,10 +102,10 @@ class ppo_agent:
         self.dones = [False for _ in range(self.args.num_workers)]
         self.logger = config_logger(self.log_path)
 
-    # start to train the network...
+    # 训练神经网络
     def learn(self):
         num_updates = self.args.total_frames // (self.args.nsteps * self.args.num_workers)
-        # get the reward to calculate other informations
+        # 计算reward
         episode_rewards = torch.zeros([self.args.num_workers, 1])
         final_rewards = torch.zeros([self.args.num_workers, 1])
         for update in range(num_updates):
@@ -111,48 +113,52 @@ class ppo_agent:
             if self.args.lr_decay:
                 self._adjust_learning_rate(update, num_updates)
             for step in range(self.args.nsteps):
+                #没有梯度变化
                 with torch.no_grad():
-                    # get tensors
+                    # 获得环境张量
                     obs_tensor = self._get_tensors(self.obs)
                     values, pis = self.net(obs_tensor)
-                # select actions
+                # 根据pis采取行动
                 actions = select_actions(pis)
-                # get the input actions
+                
                 input_actions = actions 
-                # start to store information
+                # 记录过程量，环境信息
                 mb_obs.append(np.copy(self.obs))
                 mb_actions.append(actions)
                 mb_dones.append(self.dones)
                 mb_values.append(values.detach().cpu().numpy().squeeze())
-                # start to excute the actions in the environment
+                
+                # 用actions和环境交互，并获得环境回馈
                 obs, rewards, dones, _ = self.envs.step(input_actions)
-                # update dones
+              
                 self.dones = dones
+                #每次的reward储存在mb_rewards中
                 mb_rewards.append(rewards)
-                # clear the observation
+              
                 for n, done in enumerate(dones):
                     if done:
                         self.obs[n] = self.obs[n] * 0
                 self.obs = obs
-                # process the rewards part -- display the rewards on the screen
+                # 优化rewards值
                 rewards = torch.tensor(np.expand_dims(np.stack(rewards), 1), dtype=torch.float32)
                 episode_rewards += rewards
                 masks = torch.tensor([[0.0] if done_ else [1.0] for done_ in dones], dtype=torch.float32)
                 final_rewards *= masks
                 final_rewards += (1 - masks) * episode_rewards
                 episode_rewards *= masks
-            # process the rollouts
+            # 记录过程量，环境信息
             mb_obs = np.asarray(mb_obs, dtype=np.float32)
             mb_rewards = np.asarray(mb_rewards, dtype=np.float32)
             mb_actions = np.asarray(mb_actions, dtype=np.float32)
             mb_dones = np.asarray(mb_dones, dtype=np.bool)
             mb_values = np.asarray(mb_values, dtype=np.float32)
-            # compute the last state value
+            # 计算当前状态价值
             with torch.no_grad():
-                obs_tensor = self._get_tensors(self.obs)
+                #获取环境张量
+                obs_tensor = self._get_tensors(self.obs) 
                 last_values, _ = self.net(obs_tensor)
                 last_values = last_values.detach().cpu().numpy().squeeze()
-            # start to compute advantages...
+            # 计算优化函数
             mb_returns = np.zeros_like(mb_rewards)
             mb_advs = np.zeros_like(mb_rewards)
             lastgaelam = 0
@@ -166,68 +172,71 @@ class ppo_agent:
                 delta = mb_rewards[t] + self.args.gamma * nextvalues * nextnonterminal - mb_values[t]
                 mb_advs[t] = lastgaelam = delta + self.args.gamma * self.args.tau * nextnonterminal * lastgaelam
             mb_returns = mb_advs + mb_values
-            # after compute the returns, let's process the rollouts
+            # 根据返回值，计算卷积式
             mb_obs = mb_obs.swapaxes(0, 1).reshape(self.batch_ob_shape)
             mb_actions = mb_actions.swapaxes(0, 1).flatten()
             mb_returns = mb_returns.swapaxes(0, 1).flatten()
             mb_advs = mb_advs.swapaxes(0, 1).flatten()
-            # before update the network, the old network will try to load the weights
+            
+            # 在更新神经网络之前，原有神经网络会试图更新权重
             self.old_net.load_state_dict(self.net.state_dict())
-            # start to update the network
+            # 更新神经网络
             pl, vl, ent = self._update_network(mb_obs, mb_actions, mb_returns, mb_advs)
-            # display the training information
+            
+            # 输出训练信息
             if update % self.args.display_interval == 0:
                 self.logger.info('[{}] Update: {} / {}, Frames: {}, Rewards: {:.3f}, Min: {:.3f}, Max: {:.3f}, PL: {:.3f},'\
                     'VL: {:.3f}, Ent: {:.3f}'.format(datetime.now(), update, num_updates, (update + 1)*self.args.nsteps*self.args.num_workers, \
                     final_rewards.mean().item(), final_rewards.min().item(), final_rewards.max().item(), pl, vl, ent))
-                # save the model
+                # 保存模型
                 torch.save(self.net.state_dict(), self.model_path + '/model.pt')
 
-    # update the network
+    # 更新神经网络
     def _update_network(self, obs, actions, returns, advantages):
         inds = np.arange(obs.shape[0])
         nbatch_train = obs.shape[0] // self.args.batch_size
         for _ in range(self.args.epoch):
             np.random.shuffle(inds)
             for start in range(0, obs.shape[0], nbatch_train):
-                # get the mini-batchs
+                # 计算梯度下降
                 end = start + nbatch_train
                 mbinds = inds[start:end]
                 mb_obs = obs[mbinds]
                 mb_actions = actions[mbinds]
                 mb_returns = returns[mbinds]
                 mb_advs = advantages[mbinds]
-                # convert minibatches to tensor
+                # 用梯度下降更新神经网络张量
                 mb_obs = self._get_tensors(mb_obs)
                 mb_actions = torch.tensor(mb_actions, dtype=torch.float32)
                 mb_returns = torch.tensor(mb_returns, dtype=torch.float32).unsqueeze(1)
                 mb_advs = torch.tensor(mb_advs, dtype=torch.float32).unsqueeze(1)
-                # normalize adv
+                #标准化模型
                 mb_advs = (mb_advs - mb_advs.mean()) / (mb_advs.std() + 1e-8)
                 if self.args.cuda:
                     mb_actions = mb_actions.cuda()
                     mb_returns = mb_returns.cuda()
                     mb_advs = mb_advs.cuda()
-                # start to get values
+                # 获取环境量
                 mb_values, pis = self.net(mb_obs)
-                # start to calculate the value loss...
+                # 计算损失函数
                 value_loss = (mb_returns - mb_values).pow(2).mean()
-                # start to calculate the policy loss
-                with torch.no_grad():
+                # 计算损失函数的梯度
+                with torch.no_grad():   #若不存在梯度下降
                     _, old_pis = self.old_net(mb_obs)
-                    # get the old log probs
+                    #获取原有概率分布
                     old_log_prob, _ = evaluate_actions(old_pis, mb_actions)
                     old_log_prob = old_log_prob.detach()
-                # evaluate the current policy
+                # 计算决策概率分布
                 log_prob, ent_loss = evaluate_actions(pis, mb_actions)
                 prob_ratio = torch.exp(log_prob - old_log_prob)
-                # surr1
+                # 标准化决策概率分布
                 surr1 = prob_ratio * mb_advs
                 surr2 = torch.clamp(prob_ratio, 1 - self.args.clip, 1 + self.args.clip) * mb_advs
+                #计算policy的损失函数
                 policy_loss = -torch.min(surr1, surr2).mean()
-                # final total loss
+                # 计算整体的损失
                 total_loss = policy_loss + self.args.vloss_coef * value_loss - ent_loss * self.args.ent_coef
-                # clear the grad buffer
+                # 清空梯度buffer
                 self.optimizer.zero_grad()
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.args.max_grad_norm)
@@ -235,48 +244,49 @@ class ppo_agent:
                 self.optimizer.step()
         return policy_loss.item(), value_loss.item(), ent_loss.item()
 
-    # convert the numpy array to tensors
+ 
     def _get_tensors(self, obs):
-        obs_tensor = torch.tensor(np.transpose(obs, (0, 3, 1, 2)), dtype=torch.float32)
-        # decide if put the tensor on the GPU
+        #将numpy数组转化为tensors数组
+        obs_tensor = torch.tensor(np.transpose(obs, (0, 3, 1, 2)), dtype=torch.float32) 
+        # GPU条件
         if self.args.cuda:
             obs_tensor = obs_tensor.cuda()
         return obs_tensor
 
-    # adjust the learning rate
+    # 调整学习率
     def _adjust_learning_rate(self, update, num_updates):
         lr_frac = 1 - (update / num_updates)
         adjust_lr = self.args.lr * lr_frac
         for param_group in self.optimizer.param_groups:
              param_group['lr'] = adjust_lr
 
-# create the environment
+# 创建gfootball游戏环境
 def create_single_football_env(args):
-    """Creates gfootball environment."""
     env = football_env.create_environment(\
             env_name=args.env_name, stacked=True,render=False
             )
     return env
 
 
-"""
-this network is modified for the google football
-
-"""
-# the convolution layer of deepmind
-class deepmind(nn.Module):
+ #构建卷积层
+class deepmind(nn.Module):        
     def __init__(self):
         super(deepmind, self).__init__()
-        self.conv1 = nn.Conv2d(16, 32, 8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, 4, stride=2)
+        #构建卷积层
+        #输入通道数是16，输出通道数是32，卷积核大小8，步长4
+        self.conv1 = nn.Conv2d(16, 32, 8, stride=4) 
+        #输入通道数是32，输出通道数是64，卷积核大小4，步长2
+        self.conv2 = nn.Conv2d(32, 64, 4, stride=2) 
+        #输入通道数是64，输出通道数是32，卷积核大小3，步长1
         self.conv3 = nn.Conv2d(64, 32, 3, stride=1)
+        #将32 * 5 * 8规模的输入变换成512的输出
         self.fc1 = nn.Linear(32 * 5 * 8, 512)        
-        # start to do the init...
+        # 初始化
         nn.init.orthogonal_(self.conv1.weight.data, gain=nn.init.calculate_gain('relu'))
         nn.init.orthogonal_(self.conv2.weight.data, gain=nn.init.calculate_gain('relu'))
         nn.init.orthogonal_(self.conv3.weight.data, gain=nn.init.calculate_gain('relu'))
         nn.init.orthogonal_(self.fc1.weight.data, gain=nn.init.calculate_gain('relu'))
-        # init the bias...
+        # 将bias初始化为0
         nn.init.constant_(self.conv1.bias.data, 0)
         nn.init.constant_(self.conv2.bias.data, 0)
         nn.init.constant_(self.conv3.bias.data, 0)
@@ -291,19 +301,19 @@ class deepmind(nn.Module):
 
         return x
 
-# in the initial, just the nature CNN
+# 构建神经网络
 class cnn_net(nn.Module):
     def __init__(self, num_actions):
         super(cnn_net, self).__init__()
-        self.cnn_layer = deepmind()
-        self.critic = nn.Linear(512, 1)
-        self.actor = nn.Linear(512, num_actions)
+        self.cnn_layer = deepmind()         #构建卷积层
+        self.critic = nn.Linear(512, 1)     #构建critic的线性函数
+        self.actor = nn.Linear(512, num_actions)    #构建actor的线性函数
 
-        # init the linear layer..
+        # 初始化线性神经网络
         nn.init.orthogonal_(self.critic.weight.data)
         nn.init.constant_(self.critic.bias.data, 0)
-        # init the policy layer...
-        nn.init.orthogonal_(self.actor.weight.data, gain=0.01)
+        # 初始化决策神经网络
+        nn.init.orthogonal_(self.actor.weight.data, gain=0.01)  #将缩放因子设置为0.01
         nn.init.constant_(self.actor.bias.data, 0)
 
     def forward(self, inputs):
@@ -312,47 +322,34 @@ class cnn_net(nn.Module):
         pi = F.softmax(self.actor(x), dim=1)
         return value, pi
 def get_tensors(obs):
-    return torch.tensor(np.transpose(obs, (0, 3, 1, 2)), dtype=torch.float32)
-
-
-'''
-#To Train a Model
-if __name__ == '__main__': 
-    # get the arguments
-    args = get_args()
-    # create environments
-    envs = SubprocVecEnv([(lambda _i=i: create_single_football_env(args)) for i in range(args.num_workers)], context=None)
-    # create networks
-    network = cnn_net(envs.action_space.n)
-    # create the ppo agent
-    ppo_trainer = ppo_agent(envs, args, network)
-    ppo_trainer.learn()
-    # close the environments
-    envs.close()
-'''
+    return torch.tensor(np.transpose(obs, (0, 3, 1, 2)), dtype=torch.float32) #求转置
 
 
 
-#To Test
-# get the tensors
-
-
+#主函数
 if __name__ == '__main__':
-    args = get_args()
-    model_path = './GFPPOmodel.pt'
+    args = get_args()                   #获得参数
+    model_path = './GFPPOmodel.pt'     
+     #建立环境
     env = football_env.create_environment(\
             env_name=args.env_name, stacked=True,
              render=True)
-    network = cnn_net(env.action_space.n)
+    network = cnn_net(env.action_space.n)           #构建卷积神经网络
+    #从GFPPOmodel.pt中加载模型
     network.load_state_dict(torch.load(model_path, map_location=lambda storage, loc: storage))
-    # start to do the test
+    # 初始化环境
     obs = env.reset()
+    #开始游戏
     for _ in range(10000):
+        #获取张量
         obs_tensor = get_tensors(np.expand_dims(obs, 0))
         with torch.no_grad():
             _, pi = network(obs_tensor)
+        #根据决策分布函数选取决策
         actions = torch.argmax(pi, dim=1).item()
+        #采取行动actions，获得环境交互结果
         obs, reward, done, _ = env.step(actions)
+        #完成一局游戏，重新开局
         if done:
             obs = env.reset()
     env.close()
