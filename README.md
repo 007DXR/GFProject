@@ -1,5 +1,10 @@
 这是算法设计与分析GoogleResearchFootball的Project项目。
-以下是运行代码进行训练与加载模型进行测试的具体方法
+
+
+
+## 代码文件的功能
+- train.py: 使用PPO方法进行训练
+- GFPPO.py: 加载模型进行测试，并进行图像渲染
 
 ## 环境配置
 - linux
@@ -14,8 +19,8 @@
 ## 运行代码进行训练
 
 - 在arguments.py中将“--env-name”行设置default='academy_3_vs_1_with_keeper'，则训练3vs1模型；设置default='academy_empty_goal_close'，则训练踢空门模型
-- 在GFProject-master/train文件夹下打开终端
-- 在命令行键入python3 train_example.py，便可开始训练
+- 在GFProject-master文件夹下打开终端
+- 在命令行键入python3 train.py，便可开始训练
 - 训练的模型储存在saved_models文件夹中
 
 ## 加载模型进行测试
