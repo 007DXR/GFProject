@@ -24,4 +24,3 @@
 - env_name可设置为"academy_3_vs_1_with_keeper"或"academy_empty_goal_close"，对应着3vs1和踢空门两种模式
 - render设置为"True"则开启渲染，设置为"False"则关闭渲染
 - rewards可设置为'scoring', 'scoring,checkpoints'，分表代表只有进球得分和除了带有附加得分
-
